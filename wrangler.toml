@@ -1,0 +1,13 @@
+name = "ankimcp"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "anki-cards"
+database_id = "local"  # Replace with actual ID after `wrangler d1 create anki-cards`
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "anki-decks"

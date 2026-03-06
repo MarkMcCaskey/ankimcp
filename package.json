@@ -1,0 +1,21 @@
+{
+  "name": "ankimcp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "agents": "^0.7.5",
+    "fflate": "^0.8.2",
+    "sql.js": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250306.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}
