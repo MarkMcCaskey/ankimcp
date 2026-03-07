@@ -136,8 +136,9 @@ export async function handleStart(body: Uint8Array, sessionKey: string, env: Env
 }
 
 export async function handleApplyGraves(body: Uint8Array, sessionKey: string, env: Env): Promise<void> {
-  const req: { graves: Graves } = JSON.parse(new TextDecoder().decode(body));
-  await getSession(env, sessionKey);
+  // Anki protocol uses field name "chunk" for the graves payload in applyGraves
+  const req = JSON.parse(new TextDecoder().decode(body)) as { chunk?: Graves; graves?: Graves };
+  const graves = req.chunk ?? req.graves ?? { cards: [], decks: [], notes: [] };
 
   const db = await loadCollection(env);
   if (!db) throw new Error("No collection");
@@ -145,7 +146,7 @@ export async function handleApplyGraves(body: Uint8Array, sessionKey: string, en
   try {
     ensureGravesTable(db);
     const session = await getSession(env, sessionKey);
-    applyGravesToDb(db, req.graves, session.server_usn);
+    applyGravesToDb(db, graves, session.server_usn);
     await saveCollection(env, db);
   } finally {
     db.close();
@@ -441,9 +442,12 @@ function getServerChunk(db: AnkiDatabase, clientUsn: number): Chunk {
   let count = 0;
   const usn = Number(clientUsn);
 
+  // Anki sync protocol: items with usn >= clientUsn OR usn == -1 (pending) need syncing
+  const pendingFilter = `(usn >= ${usn} OR usn = -1)`;
+
   // Get changed revlog entries
   const revlogResult = db.exec(
-    `SELECT id, cid, usn, ease, ivl, lastIvl, factor, time, type FROM revlog WHERE usn >= ${usn} ORDER BY id LIMIT ${CHUNK_SIZE}`
+    `SELECT id, cid, usn, ease, ivl, lastIvl, factor, time, type FROM revlog WHERE ${pendingFilter} ORDER BY id LIMIT ${CHUNK_SIZE}`
   );
   if (revlogResult.length > 0 && revlogResult[0].values.length > 0) {
     chunk.revlog = revlogResult[0].values.map((row) => row as unknown as RevlogTuple);
@@ -454,7 +458,7 @@ function getServerChunk(db: AnkiDatabase, clientUsn: number): Chunk {
   const cardLimit = CHUNK_SIZE - count;
   if (cardLimit > 0) {
     const cardResult = db.exec(
-      `SELECT id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data FROM cards WHERE usn >= ${usn} ORDER BY id LIMIT ${cardLimit}`
+      `SELECT id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data FROM cards WHERE ${pendingFilter} ORDER BY id LIMIT ${cardLimit}`
     );
     if (cardResult.length > 0 && cardResult[0].values.length > 0) {
       chunk.cards = cardResult[0].values.map((row) => row as unknown as CardTuple);
@@ -466,7 +470,7 @@ function getServerChunk(db: AnkiDatabase, clientUsn: number): Chunk {
   const noteLimit = CHUNK_SIZE - count;
   if (noteLimit > 0) {
     const noteResult = db.exec(
-      `SELECT id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data FROM notes WHERE usn >= ${usn} ORDER BY id LIMIT ${noteLimit}`
+      `SELECT id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data FROM notes WHERE ${pendingFilter} ORDER BY id LIMIT ${noteLimit}`
     );
     if (noteResult.length > 0 && noteResult[0].values.length > 0) {
       chunk.notes = noteResult[0].values.map((row) => row as unknown as NoteTuple);

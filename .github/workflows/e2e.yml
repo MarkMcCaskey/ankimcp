@@ -28,10 +28,24 @@ jobs:
       - name: Apply D1 schema (local)
         run: npx wrangler d1 execute anki-cards --file=schema.sql --local
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies
+        run: pip install zstandard requests
+
       - name: Start wrangler dev and run e2e tests
         run: |
+          # Write .dev.vars for wrangler
+          cat > .dev.vars <<'VARS'
+          AUTH_TOKEN=e2e-test-token
+          SYNC_USERNAME=testuser
+          SYNC_PASSWORD=testpass
+          VARS
+
           # Start wrangler dev in background
-          AUTH_TOKEN=e2e-test-token npx wrangler dev --port 8799 --local &
+          npx wrangler dev --port 8799 --local &
           WRANGLER_PID=$!
 
           # Wait for server
@@ -43,8 +57,16 @@ jobs:
             sleep 1
           done
 
-          # Run e2e tests
+          # Run JS e2e tests
           npm run test:e2e
+
+          # Run Python sync protocol e2e tests
+          echo ""
+          echo "=== Running Anki Sync Protocol E2E Tests ==="
+          SYNC_URL=http://127.0.0.1:8799 \
+          SYNC_USERNAME=testuser \
+          SYNC_PASSWORD=testpass \
+          python test/e2e-sync-protocol.py
 
           # Cleanup
           kill $WRANGLER_PID 2>/dev/null || true

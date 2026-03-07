@@ -711,6 +711,260 @@ describe("Full incremental sync flow (e2e)", () => {
     expect(d1Remaining?.cnt).toBe(1);
   });
 
+  it("handles note deletion cascading to cards", async () => {
+    const sessionKey = "e2e-session-cascade";
+
+    // Start
+    await SELF.fetch(
+      syncRequest("start", { minUsn: 0, lnewer: true }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Delete note 100 via graves (should cascade delete its card 200)
+    await SELF.fetch(
+      syncRequest("applyGraves", { graves: { cards: [], decks: [], notes: [100] } }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Verify note and its card are deleted
+    const { loadCollection } = await import("../src/anki-collection");
+    const db = await loadCollection(env);
+    try {
+      const notes = db!.exec("SELECT COUNT(*) FROM notes WHERE id = 100");
+      expect(notes[0].values[0][0]).toBe(0);
+      const cards = db!.exec("SELECT COUNT(*) FROM cards WHERE nid = 100");
+      expect(cards[0].values[0][0]).toBe(0);
+    } finally {
+      db!.close();
+    }
+  });
+
+  it("handles deck deletion via graves", async () => {
+    const sessionKey = "e2e-session-deck-del";
+
+    // Start
+    await SELF.fetch(
+      syncRequest("start", { minUsn: 0, lnewer: true }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Delete test deck 1000 via graves
+    await SELF.fetch(
+      syncRequest("applyGraves", { graves: { cards: [], decks: [1000], notes: [] } }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Verify deck is removed from decks JSON and cards in that deck are deleted
+    const { loadCollection } = await import("../src/anki-collection");
+    const db = await loadCollection(env);
+    try {
+      const col = db!.exec("SELECT decks FROM col LIMIT 1");
+      const decks = JSON.parse(col[0].values[0][0] as string);
+      expect(decks["1000"]).toBeUndefined();
+      // Cards that were in deck 1000 should be deleted
+      const cards = db!.exec("SELECT COUNT(*) FROM cards WHERE did = 1000");
+      expect(cards[0].values[0][0]).toBe(0);
+    } finally {
+      db!.close();
+    }
+  });
+
+  it("applyGraves accepts 'chunk' field name per Anki protocol", async () => {
+    const sessionKey = "e2e-session-chunk-field";
+
+    // Start
+    await SELF.fetch(
+      syncRequest("start", { minUsn: 0, lnewer: true }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Send graves using the "chunk" field name (what Anki actually sends)
+    const gravesRes = await SELF.fetch(
+      syncRequest("applyGraves", { chunk: { cards: [201], decks: [], notes: [] } }, { syncKey: hostKey, sessionKey })
+    );
+    expect(gravesRes.status).toBe(200);
+
+    // Verify card 201 is deleted
+    const { loadCollection } = await import("../src/anki-collection");
+    const db = await loadCollection(env);
+    try {
+      const cards = db!.exec("SELECT COUNT(*) FROM cards WHERE id = 201");
+      expect(cards[0].values[0][0]).toBe(0);
+    } finally {
+      db!.close();
+    }
+  });
+
+  it("updates existing cards via applyChunk (upsert)", async () => {
+    const sessionKey = "e2e-session-upsert";
+
+    // Start
+    await SELF.fetch(
+      syncRequest("start", { minUsn: 0, lnewer: true }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Update existing card 200: change interval from 21 to 42
+    const now = Math.floor(Date.now() / 1000);
+    const applyChunkRes = await SELF.fetch(
+      syncRequest("applyChunk", {
+        chunk: {
+          done: true,
+          notes: [],
+          cards: [
+            // Same card ID 200, but with updated interval (index 9 = ivl)
+            [200, 100, 1000, 0, now, -1, 2, 2, 10, 42, 2500, 10, 1, 0, 0, 0, 0, ""]
+          ],
+          revlog: [],
+        }
+      }, { syncKey: hostKey, sessionKey })
+    );
+    expect(applyChunkRes.status).toBe(200);
+
+    // Verify the card was updated (not duplicated)
+    const { loadCollection } = await import("../src/anki-collection");
+    const db = await loadCollection(env);
+    try {
+      const cards = db!.exec("SELECT ivl, reps, lapses FROM cards WHERE id = 200");
+      expect(cards[0].values.length).toBe(1); // still just one card
+      expect(cards[0].values[0][0]).toBe(42); // updated interval
+      expect(cards[0].values[0][1]).toBe(10); // updated reps
+      expect(cards[0].values[0][2]).toBe(1);  // updated lapses
+    } finally {
+      db!.close();
+    }
+  });
+
+  it("handles model/notetype changes via applyChanges", async () => {
+    const sessionKey = "e2e-session-models";
+
+    // Start
+    await SELF.fetch(
+      syncRequest("start", { minUsn: 0, lnewer: true }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Apply graves (empty)
+    await SELF.fetch(
+      syncRequest("applyGraves", { graves: { cards: [], decks: [], notes: [] } }, { syncKey: hostKey, sessionKey })
+    );
+
+    // Send a new model from client
+    const newModel = {
+      id: 9999999,
+      name: "Cloze",
+      mod: 0,
+      usn: -1,
+      flds: [{ name: "Text", ord: 0 }, { name: "Extra", ord: 1 }],
+      tmpls: [{ name: "Cloze", qfmt: "{{cloze:Text}}", afmt: "{{cloze:Text}}<br>{{Extra}}", ord: 0 }],
+      tags: [],
+      did: 1,
+      type: 1,
+      css: "",
+      sortf: 0,
+    };
+
+    const changesRes = await SELF.fetch(
+      syncRequest("applyChanges", {
+        changes: { models: [newModel], decks: [[], []], tags: ["cloze-tag"] }
+      }, { syncKey: hostKey, sessionKey })
+    );
+    expect(changesRes.status).toBe(200);
+
+    // Verify model was added
+    const { loadCollection } = await import("../src/anki-collection");
+    const db = await loadCollection(env);
+    try {
+      const col = db!.exec("SELECT models, tags FROM col LIMIT 1");
+      const models = JSON.parse(col[0].values[0][0] as string);
+      expect(models["9999999"]).toBeDefined();
+      expect(models["9999999"].name).toBe("Cloze");
+      // USN should be updated to server's USN
+      expect(models["9999999"].usn).toBeGreaterThanOrEqual(0);
+
+      const tags = JSON.parse(col[0].values[0][1] as string);
+      expect(tags["cloze-tag"]).toBeDefined();
+    } finally {
+      db!.close();
+    }
+  });
+
+  it("two consecutive incremental syncs work correctly", async () => {
+    // First sync: add a card
+    const session1 = "e2e-consec-1";
+    await SELF.fetch(syncRequest("start", { minUsn: 0, lnewer: true }, { syncKey: hostKey, sessionKey: session1 }));
+    await SELF.fetch(syncRequest("applyGraves", { graves: { cards: [], decks: [], notes: [] } }, { syncKey: hostKey, sessionKey: session1 }));
+    await SELF.fetch(syncRequest("applyChanges", { changes: { models: [], decks: [[], []], tags: [] } }, { syncKey: hostKey, sessionKey: session1 }));
+    await SELF.fetch(syncRequest("chunk", null, { syncKey: hostKey, sessionKey: session1 }));
+
+    const now = Math.floor(Date.now() / 1000);
+    await SELF.fetch(syncRequest("applyChunk", {
+      chunk: {
+        done: true,
+        notes: [[300, "guid300", 1234567890, now, -1, "", "First\x1fSecond", "First", "", 0, ""]],
+        cards: [[400, 300, 1000, 0, now, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""]],
+        revlog: [],
+      }
+    }, { syncKey: hostKey, sessionKey: session1 }));
+
+    // Sanity check and finish first sync
+    const { loadCollection } = await import("../src/anki-collection");
+    let db = await loadCollection(env);
+    let cc: number, nc: number, rc: number;
+    try {
+      cc = db!.exec("SELECT COUNT(*) FROM cards")[0].values[0][0] as number;
+      nc = db!.exec("SELECT COUNT(*) FROM notes")[0].values[0][0] as number;
+      rc = db!.exec("SELECT COUNT(*) FROM revlog")[0].values[0][0] as number;
+    } finally { db!.close(); }
+
+    await SELF.fetch(syncRequest("sanityCheck2", { client: [[0,0,0], cc, nc, rc, 0, 1, 2, 1] }, { syncKey: hostKey, sessionKey: session1 }));
+    await SELF.fetch(syncRequest("finish", null, { syncKey: hostKey, sessionKey: session1 }));
+
+    // Get new USN
+    db = await loadCollection(env);
+    let newUsn: number;
+    try {
+      newUsn = db!.exec("SELECT usn FROM col LIMIT 1")[0].values[0][0] as number;
+    } finally { db!.close(); }
+    expect(newUsn).toBe(1);
+
+    // Second sync: add another card using the new USN
+    const session2 = "e2e-consec-2";
+    await SELF.fetch(syncRequest("start", { minUsn: 1, lnewer: true }, { syncKey: hostKey, sessionKey: session2 }));
+    await SELF.fetch(syncRequest("applyGraves", { graves: { cards: [], decks: [], notes: [] } }, { syncKey: hostKey, sessionKey: session2 }));
+    await SELF.fetch(syncRequest("applyChanges", { changes: { models: [], decks: [[], []], tags: [] } }, { syncKey: hostKey, sessionKey: session2 }));
+
+    // Chunk should have no changes since we synced with minUsn=1
+    const chunkRes = await SELF.fetch(syncRequest("chunk", null, { syncKey: hostKey, sessionKey: session2 }));
+    const chunk = await chunkRes.json() as { done: boolean; cards?: unknown[]; notes?: unknown[] };
+    expect(chunk.done).toBe(true);
+    expect(chunk.cards).toBeUndefined();
+
+    // Add another new card
+    await SELF.fetch(syncRequest("applyChunk", {
+      chunk: {
+        done: true,
+        notes: [[301, "guid301", 1234567890, now, -1, "", "Third\x1fFourth", "Third", "", 0, ""]],
+        cards: [[401, 301, 1000, 0, now, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""]],
+        revlog: [],
+      }
+    }, { syncKey: hostKey, sessionKey: session2 }));
+
+    db = await loadCollection(env);
+    try {
+      cc = db!.exec("SELECT COUNT(*) FROM cards")[0].values[0][0] as number;
+      nc = db!.exec("SELECT COUNT(*) FROM notes")[0].values[0][0] as number;
+      rc = db!.exec("SELECT COUNT(*) FROM revlog")[0].values[0][0] as number;
+    } finally { db!.close(); }
+
+    await SELF.fetch(syncRequest("sanityCheck2", { client: [[0,0,0], cc, nc, rc, 0, 1, 2, 1] }, { syncKey: hostKey, sessionKey: session2 }));
+    await SELF.fetch(syncRequest("finish", null, { syncKey: hostKey, sessionKey: session2 }));
+
+    // Verify: 4 cards total (2 original + 2 added)
+    const d1Cards = await env.DB.prepare("SELECT COUNT(*) as cnt FROM cards").first();
+    expect(d1Cards?.cnt).toBe(4);
+
+    // Verify USN is now 2
+    db = await loadCollection(env);
+    try {
+      const usn = db!.exec("SELECT usn FROM col LIMIT 1")[0].values[0][0] as number;
+      expect(usn).toBe(2);
+    } finally { db!.close(); }
+  });
+
   it("subsequent sync with matching USN has no changes", async () => {
     // First sync to set USN
     const sessionKey1 = "e2e-session-3a";
