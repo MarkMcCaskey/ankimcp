@@ -1,0 +1,50 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Apply D1 schema (local)
+        run: npx wrangler d1 execute anki-cards --file=schema.sql --local
+
+      - name: Start wrangler dev and run e2e tests
+        run: |
+          # Start wrangler dev in background
+          AUTH_TOKEN=e2e-test-token npx wrangler dev --port 8799 --local &
+          WRANGLER_PID=$!
+
+          # Wait for server
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:8799/ > /dev/null 2>&1; then
+              echo "Server ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Run e2e tests
+          npm run test:e2e
+
+          # Cleanup
+          kill $WRANGLER_PID 2>/dev/null || true

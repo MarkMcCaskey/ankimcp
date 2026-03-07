@@ -1,7 +1,11 @@
 import { parseApkg } from "./apkg";
 import type { Env } from "./types";
 
-export async function handleUpload(
+/**
+ * Sync endpoint: merges .apkg data into D1 without deleting existing decks.
+ * Upserts decks, notes, cards, and review history.
+ */
+export async function handleSync(
   request: Request,
   env: Env
 ): Promise<Response> {
@@ -27,43 +31,66 @@ export async function handleUpload(
 
   const arrayBuffer = await file.arrayBuffer();
 
-  const r2Key = `uploads/${Date.now()}-${file.name}`;
+  const r2Key = `syncs/${Date.now()}-${file.name}`;
   await env.BUCKET.put(r2Key, arrayBuffer);
 
   const { decks, reviews } = await parseApkg(arrayBuffer);
 
-  // Clear existing data and insert new
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM revlog"),
-    env.DB.prepare("DELETE FROM cards"),
-    env.DB.prepare("DELETE FROM notes"),
-    env.DB.prepare("DELETE FROM decks"),
-  ]);
+  let notesUpserted = 0;
+  let cardsUpserted = 0;
 
   for (const deck of decks) {
     await env.DB.prepare(
-      "INSERT INTO decks (id, name, card_count) VALUES (?, ?, ?)"
+      `INSERT INTO decks (id, name, card_count)
+       VALUES (?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         name = excluded.name,
+         card_count = excluded.card_count,
+         uploaded_at = datetime('now')`
     )
       .bind(deck.id, deck.name, deck.cards.length)
       .run();
 
     for (const note of deck.notes) {
       await env.DB.prepare(
-        "INSERT OR IGNORE INTO notes (id, deck_id, model_name, fields, field_names, tags) VALUES (?, ?, ?, ?, ?, ?)"
+        `INSERT INTO notes (id, deck_id, model_name, fields, field_names, tags)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           deck_id = excluded.deck_id,
+           model_name = excluded.model_name,
+           fields = excluded.fields,
+           field_names = excluded.field_names,
+           tags = excluded.tags`
       )
         .bind(note.id, deck.id, note.modelName, JSON.stringify(note.fields), JSON.stringify(note.fieldNames), note.tags)
         .run();
+      notesUpserted++;
     }
 
     for (const card of deck.cards) {
       await env.DB.prepare(
-        "INSERT OR IGNORE INTO cards (id, note_id, deck_id, ord, type, queue, due, ivl, factor, reps, lapses, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        `INSERT INTO cards (id, note_id, deck_id, ord, type, queue, due, ivl, factor, reps, lapses, flags)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           note_id = excluded.note_id,
+           deck_id = excluded.deck_id,
+           ord = excluded.ord,
+           type = excluded.type,
+           queue = excluded.queue,
+           due = excluded.due,
+           ivl = excluded.ivl,
+           factor = excluded.factor,
+           reps = excluded.reps,
+           lapses = excluded.lapses,
+           flags = excluded.flags`
       )
         .bind(card.id, card.noteId, card.deckId, card.ord, card.type, card.queue, card.due, card.ivl, card.factor, card.reps, card.lapses, card.flags)
         .run();
+      cardsUpserted++;
     }
   }
 
+  // Upsert reviews (INSERT OR IGNORE since review IDs are timestamps and immutable)
   for (const rev of reviews) {
     await env.DB.prepare(
       "INSERT OR IGNORE INTO revlog (id, card_id, ease, ivl, last_ivl, factor, review_time, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -79,7 +106,12 @@ export async function handleUpload(
   }));
 
   return new Response(
-    JSON.stringify({ success: true, r2Key, decks: summary, reviewCount: reviews.length }),
+    JSON.stringify({
+      success: true,
+      r2Key,
+      decks: summary,
+      totals: { notesUpserted, cardsUpserted, reviewsImported: reviews.length },
+    }),
     { headers: { "Content-Type": "application/json" } }
   );
 }
