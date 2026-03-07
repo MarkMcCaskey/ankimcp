@@ -3,6 +3,7 @@ import { createMcpHandler } from "agents/mcp";
 import { z } from "zod";
 import { handleUpload } from "./upload";
 import { handleSync } from "./sync";
+import { handleAnkiSync } from "./anki-sync";
 import type { Env } from "./types";
 
 function parseFieldMap(fieldsJson: string, fieldNamesJson: string): Record<string, string> {
@@ -562,6 +563,11 @@ export default {
 
     if (url.pathname === "/sync" && request.method === "POST") {
       return handleSync(request, env);
+    }
+
+    // Anki native sync protocol (AnkiMobile / Anki Desktop)
+    if (url.pathname.startsWith("/sync/")) {
+      return handleAnkiSync(request, env, url.pathname);
     }
 
     if (url.pathname.startsWith("/mcp")) {

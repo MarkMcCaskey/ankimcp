@@ -78,8 +78,18 @@ export async function parseApkg(
     );
   }
 
+  return parseAnkiSqlite(dbFile);
+}
+
+/**
+ * Parse a raw Anki SQLite database (collection.anki2 / .anki21) and return decks, notes, cards, and review history.
+ * Used by both .apkg upload (after ZIP extraction) and Anki sync protocol upload (raw SQLite).
+ */
+export async function parseAnkiSqlite(
+  dbBytes: Uint8Array
+): Promise<ParseResult> {
   const SQL = await initSqlJs();
-  const db = new SQL.Database(dbFile);
+  const db = new SQL.Database(dbBytes);
 
   try {
     const decks = extractDecks(db);

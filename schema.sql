@@ -52,3 +52,11 @@ CREATE INDEX IF NOT EXISTS idx_revlog_id ON revlog(id);
 CREATE INDEX IF NOT EXISTS idx_cards_lapses ON cards(lapses);
 CREATE INDEX IF NOT EXISTS idx_cards_reps ON cards(reps);
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(due);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  host_key TEXT NOT NULL,
+  schema_mod INTEGER DEFAULT 0,
+  last_mod INTEGER DEFAULT 0,
+  collection_r2_key TEXT
+);
