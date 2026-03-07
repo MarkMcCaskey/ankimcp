@@ -3,13 +3,14 @@ name: Deploy to Cloudflare Workers
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 env:
   CLOUDFLARE_ACCOUNT_ID: "2fdd148bef678c8d5c2ff4917f789a2c"
 
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +25,22 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
-      - name: Test
+      - name: Unit tests
         run: npx vitest run
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
 
       - name: Apply D1 schema
         run: npx wrangler d1 execute anki-cards --file=schema.sql --remote
@@ -33,7 +48,13 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
       - name: Deploy Worker
-        run: npx wrangler deploy
+        id: deploy
+        run: |
+          OUTPUT=$(npx wrangler deploy 2>&1)
+          echo "$OUTPUT"
+          # Extract the worker URL from deploy output
+          URL=$(echo "$OUTPUT" | grep -oP 'https://[^\s]+\.workers\.dev' | head -1)
+          echo "worker_url=$URL" >> "$GITHUB_OUTPUT"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
@@ -41,3 +62,55 @@ jobs:
         run: echo "${{ secrets.AUTH_TOKEN }}" | npx wrangler secret put AUTH_TOKEN
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Smoke test — health check
+        if: steps.deploy.outputs.worker_url != ''
+        run: |
+          URL="${{ steps.deploy.outputs.worker_url }}"
+          echo "Testing $URL ..."
+          # Wait for worker to be ready
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed!"
+              break
+            fi
+            echo "Attempt $i: got $STATUS, retrying..."
+            sleep 3
+          done
+          # Final check
+          RESPONSE=$(curl -s "$URL/health")
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"status":"ok"' || (echo "Health check failed!" && exit 1)
+
+      - name: Smoke test — upload fixture
+        if: steps.deploy.outputs.worker_url != '' && secrets.AUTH_TOKEN != ''
+        run: |
+          URL="${{ steps.deploy.outputs.worker_url }}"
+          # Upload the test fixture
+          STATUS=$(curl -s -o /tmp/upload_response.json -w "%{http_code}" \
+            -X POST "$URL/upload" \
+            -H "Authorization: Bearer ${{ secrets.AUTH_TOKEN }}" \
+            -F "file=@test/fixtures/spanish.apkg")
+          echo "Upload status: $STATUS"
+          cat /tmp/upload_response.json
+          [ "$STATUS" = "200" ] || (echo "Upload failed!" && exit 1)
+          # Verify upload response
+          cat /tmp/upload_response.json | grep -q '"success":true' || (echo "Upload response invalid!" && exit 1)
+
+      - name: Smoke test — auth rejection
+        if: steps.deploy.outputs.worker_url != ''
+        run: |
+          URL="${{ steps.deploy.outputs.worker_url }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$URL/upload")
+          echo "No-auth status: $STATUS"
+          [ "$STATUS" = "401" ] || (echo "Expected 401, got $STATUS" && exit 1)
+          echo "Auth rejection works!"
+
+      - name: Print deployment URL
+        if: steps.deploy.outputs.worker_url != ''
+        run: |
+          echo "=========================================="
+          echo "Deployed to: ${{ steps.deploy.outputs.worker_url }}"
+          echo "MCP endpoint: ${{ steps.deploy.outputs.worker_url }}/mcp"
+          echo "=========================================="
