@@ -1,0 +1,115 @@
+name: Smoke Test Live Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_url:
+        description: 'Worker URL to test'
+        required: false
+        default: 'https://ankimcp.7f229vxw7t.workers.dev'
+  push:
+    branches: [main, 'claude/**']
+
+env:
+  WORKER_URL: ${{ inputs.worker_url || 'https://ankimcp.7f229vxw7t.workers.dev' }}
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Health check — GET /
+        run: |
+          RESPONSE=$(curl -sf "$WORKER_URL/")
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | jq .
+          echo "$RESPONSE" | jq -e '.status == "ok"'
+
+      - name: Health check — GET /health
+        run: |
+          RESPONSE=$(curl -sf "$WORKER_URL/health")
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | jq -e '.status == "ok"'
+
+      - name: Auth rejection — no token
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WORKER_URL/upload")
+          echo "No-auth status: $STATUS"
+          [ "$STATUS" = "401" ] || (echo "Expected 401, got $STATUS" && exit 1)
+
+      - name: Auth rejection — bad token
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WORKER_URL/upload" \
+            -H "Authorization: Bearer wrong-token")
+          echo "Bad-auth status: $STATUS"
+          [ "$STATUS" = "401" ] || (echo "Expected 401, got $STATUS" && exit 1)
+
+      - name: Upload test deck
+        if: ${{ secrets.AUTH_TOKEN != '' }}
+        run: |
+          RESPONSE=$(curl -sf -X POST "$WORKER_URL/upload" \
+            -H "Authorization: Bearer ${{ secrets.AUTH_TOKEN }}" \
+            -F "file=@test/fixtures/spanish.apkg")
+          echo "Upload response:"
+          echo "$RESPONSE" | jq .
+          echo "$RESPONSE" | jq -e '.success == true'
+          # Save deck info for later
+          echo "$RESPONSE" | jq -r '.decks[0].name' > /tmp/deck_name.txt
+          echo "Uploaded deck: $(cat /tmp/deck_name.txt)"
+
+      - name: MCP — list_decks
+        if: ${{ secrets.AUTH_TOKEN != '' }}
+        run: |
+          RESPONSE=$(curl -sf -X POST "$WORKER_URL/mcp" \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"list_decks","arguments":{}}}')
+          echo "list_decks response:"
+          echo "$RESPONSE" | jq .
+          # Verify we got results
+          echo "$RESPONSE" | jq -e '.result'
+
+      - name: MCP — search_cards
+        if: ${{ secrets.AUTH_TOKEN != '' }}
+        run: |
+          RESPONSE=$(curl -sf -X POST "$WORKER_URL/mcp" \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"search_cards","arguments":{"query":"hello"}}}')
+          echo "search_cards response:"
+          echo "$RESPONSE" | jq .
+          echo "$RESPONSE" | jq -e '.result'
+
+      - name: MCP — get_study_stats
+        if: ${{ secrets.AUTH_TOKEN != '' }}
+        run: |
+          RESPONSE=$(curl -sf -X POST "$WORKER_URL/mcp" \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"get_study_stats","arguments":{}}}')
+          echo "get_study_stats response:"
+          echo "$RESPONSE" | jq .
+          echo "$RESPONSE" | jq -e '.result'
+
+      - name: Sync protocol — hostKey auth
+        if: ${{ secrets.SYNC_USERNAME != '' && secrets.SYNC_PASSWORD != '' }}
+        run: |
+          RESPONSE=$(curl -sf -X POST "$WORKER_URL/sync/hostKey" \
+            -H "Content-Type: application/json" \
+            -d "{\"u\":\"${{ secrets.SYNC_USERNAME }}\",\"p\":\"${{ secrets.SYNC_PASSWORD }}\"}")
+          echo "hostKey response:"
+          echo "$RESPONSE" | jq .
+          echo "$RESPONSE" | jq -e '.key'
+
+      - name: Sync protocol — bad credentials rejected
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WORKER_URL/sync/hostKey" \
+            -H "Content-Type: application/json" \
+            -d '{"u":"wrong","p":"wrong"}')
+          echo "Bad creds status: $STATUS"
+          [ "$STATUS" = "403" ] || (echo "Expected 403, got $STATUS" && exit 1)
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "Smoke tests completed for: $WORKER_URL"
+          echo "=========================================="
