@@ -1,5 +1,8 @@
 import { unzipSync } from "fflate";
-import initSqlJs, { type Database } from "sql.js";
+// Use asm.js build to avoid WASM loading issues in Workers
+// @ts-expect-error -- no types for asm build
+import initSqlJs from "sql.js/dist/sql-asm.js";
+import type { Database } from "sql.js";
 
 /** A parsed Anki deck with its notes and cards */
 export interface ParsedDeck {
