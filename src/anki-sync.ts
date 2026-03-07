@@ -1,5 +1,15 @@
 import { parseAnkiSqlite } from "./apkg";
 import type { Env } from "./types";
+import {
+  handleStart,
+  handleApplyGraves,
+  handleApplyChanges,
+  handleChunk,
+  handleApplyChunk,
+  handleSanityCheck,
+  handleFinish,
+  handleAbort as handleIncrementalAbort,
+} from "./anki-sync-incremental";
 
 import * as fzstd from "fzstd";
 import { decompressSync as gunzipSync } from "fflate";
@@ -31,17 +41,55 @@ export async function handleAnkiSync(
         return await handleUpload(request, env);
       case "download":
         return await handleDownload(request, env);
-      case "abort":
+      case "abort": {
+        const { syncHeader: abortHeader } = await parseSyncRequest(request);
+        if (await validateHostKey(env, abortHeader.syncKey)) {
+          await handleIncrementalAbort(abortHeader.sessionKey, env);
+        }
         return new Response("", { status: 200 });
-      // Incremental sync endpoints — not yet implemented, return error
-      case "start":
-      case "applyGraves":
-      case "applyChanges":
-      case "chunk":
-      case "applyChunk":
-      case "sanityCheck2":
-      case "finish":
-        return jsonResponse({ error: "incremental sync not supported" }, 501);
+      }
+      case "start": {
+        const { syncHeader: startHeader, body: startBody } = await parseSyncRequest(request);
+        if (!(await validateHostKey(env, startHeader.syncKey))) return jsonResponse({ error: "invalid host key" }, 403);
+        const graves = await handleStart(startBody, startHeader.sessionKey, env);
+        return jsonResponse(graves);
+      }
+      case "applyGraves": {
+        const { syncHeader: gravesHeader, body: gravesBody } = await parseSyncRequest(request);
+        if (!(await validateHostKey(env, gravesHeader.syncKey))) return jsonResponse({ error: "invalid host key" }, 403);
+        await handleApplyGraves(gravesBody, gravesHeader.sessionKey, env);
+        return jsonResponse(null);
+      }
+      case "applyChanges": {
+        const { syncHeader: changesHeader, body: changesBody } = await parseSyncRequest(request);
+        if (!(await validateHostKey(env, changesHeader.syncKey))) return jsonResponse({ error: "invalid host key" }, 403);
+        const serverChanges = await handleApplyChanges(changesBody, changesHeader.sessionKey, env);
+        return jsonResponse(serverChanges);
+      }
+      case "chunk": {
+        const { syncHeader: chunkHeader } = await parseSyncRequest(request);
+        if (!(await validateHostKey(env, chunkHeader.syncKey))) return jsonResponse({ error: "invalid host key" }, 403);
+        const chunk = await handleChunk(chunkHeader.sessionKey, env);
+        return jsonResponse(chunk);
+      }
+      case "applyChunk": {
+        const { syncHeader: applyChunkHeader, body: applyChunkBody } = await parseSyncRequest(request);
+        if (!(await validateHostKey(env, applyChunkHeader.syncKey))) return jsonResponse({ error: "invalid host key" }, 403);
+        await handleApplyChunk(applyChunkBody, applyChunkHeader.sessionKey, env);
+        return jsonResponse(null);
+      }
+      case "sanityCheck2": {
+        const { syncHeader: sanityHeader, body: sanityBody } = await parseSyncRequest(request);
+        if (!(await validateHostKey(env, sanityHeader.syncKey))) return jsonResponse({ error: "invalid host key" }, 403);
+        const sanityResult = await handleSanityCheck(sanityBody, sanityHeader.sessionKey, env);
+        return jsonResponse(sanityResult);
+      }
+      case "finish": {
+        const { syncHeader: finishHeader } = await parseSyncRequest(request);
+        if (!(await validateHostKey(env, finishHeader.syncKey))) return jsonResponse({ error: "invalid host key" }, 403);
+        const timestamp = await handleFinish(finishHeader.sessionKey, env);
+        return jsonResponse(timestamp);
+      }
       default:
         return new Response("Not Found", { status: 404 });
     }
@@ -97,31 +145,56 @@ async function handleMeta(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: "invalid host key" }, 403);
   }
 
-  // Get current sync state
-  const state = await env.DB.prepare(
-    "SELECT schema_mod, last_mod FROM sync_state WHERE id = 1"
-  ).first();
-
-  const schemaMod = (state?.schema_mod as number) ?? 0;
-  const lastMod = (state?.last_mod as number) ?? 0;
   const now = Math.floor(Date.now() / 1000);
 
-  // Return metadata. By returning our stored schema_mod (which starts at 0 and
-  // will differ from the client's schema timestamp), we force a full sync.
-  // Once we store the client's schema after upload, subsequent metas will
-  // return the matching schema, preventing unnecessary full-sync prompts
-  // (the user would still get prompted if client schema changes, e.g. after
-  // editing note types).
+  // Try to read metadata from the actual Anki collection in R2
+  const db = await loadCollectionSafe(env);
+  if (db) {
+    try {
+      const col = db.exec("SELECT mod, scm, usn FROM col LIMIT 1");
+      if (col.length > 0 && col[0].values.length > 0) {
+        const row = col[0].values[0];
+        return jsonResponse({
+          scm: row[1] as number,     // schema mod timestamp
+          ts: now,                    // server time
+          mod: row[0] as number,     // collection mod timestamp
+          usn: row[2] as number,     // server USN
+          musn: 0,                   // media USN (no media sync)
+          msg: "",
+          cont: true,
+          hostNum: 0,
+          empty: false,
+          media_usn: 0,
+        });
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  // No collection stored yet - return empty state (forces full sync)
   return jsonResponse({
-    scm: schemaMod,
+    scm: 0,
     ts: now,
-    mod: lastMod,
-    usn: -1,
+    mod: 0,
+    usn: 0,
     musn: 0,
     msg: "",
     cont: true,
     hostNum: 0,
+    empty: true,
+    media_usn: 0,
   });
+}
+
+/** Load collection from R2 without throwing on failure */
+async function loadCollectionSafe(env: Env): Promise<import("./anki-collection").AnkiDatabase | null> {
+  try {
+    const { loadCollection } = await import("./anki-collection");
+    return await loadCollection(env);
+  } catch {
+    return null;
+  }
 }
 
 // ─── upload: receive full collection from client ───

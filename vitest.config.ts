@@ -15,6 +15,8 @@ export default defineWorkersConfig({
           },
           bindings: {
             AUTH_TOKEN: "test-secret-token",
+            SYNC_USERNAME: "testuser",
+            SYNC_PASSWORD: "testpass",
           },
         },
       },

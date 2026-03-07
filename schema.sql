@@ -60,3 +60,12 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_mod INTEGER DEFAULT 0,
   collection_r2_key TEXT
 );
+
+CREATE TABLE IF NOT EXISTS sync_session (
+  session_key TEXT PRIMARY KEY,
+  server_usn INTEGER NOT NULL,
+  client_usn INTEGER NOT NULL,
+  client_is_newer INTEGER DEFAULT 0,
+  chunks_sent INTEGER DEFAULT 0,
+  created_at INTEGER DEFAULT (unixepoch())
+);
