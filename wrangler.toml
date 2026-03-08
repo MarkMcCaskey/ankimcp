@@ -11,3 +11,18 @@ database_id = "537b453d-c00b-45b8-9a6d-f34ca13a0a1b"
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "anki-decks"
+
+[[secrets_store_secrets]]
+binding = "AUTH_TOKEN"
+store_id = "ecad0b7d50454b28ae0a06dc78ec39d7"
+secret_name = "AUTH_TOKEN"
+
+[[secrets_store_secrets]]
+binding = "SYNC_USERNAME"
+store_id = "ecad0b7d50454b28ae0a06dc78ec39d7"
+secret_name = "SYNC_USERNAME"
+
+[[secrets_store_secrets]]
+binding = "SYNC_PASSWORD"
+store_id = "ecad0b7d50454b28ae0a06dc78ec39d7"
+secret_name = "SYNC_PASSWORD"

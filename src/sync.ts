@@ -1,6 +1,14 @@
 import { parseApkg } from "./apkg";
 import type { Env } from "./types";
 
+const BATCH_SIZE = 100;
+
+async function batchInsert(db: D1Database, statements: D1PreparedStatement[]): Promise<void> {
+  for (let i = 0; i < statements.length; i += BATCH_SIZE) {
+    await db.batch(statements.slice(i, i + BATCH_SIZE));
+  }
+}
+
 /**
  * Sync endpoint: merges .apkg data into D1 without deleting existing decks.
  * Upserts decks, notes, cards, and review history.
@@ -11,7 +19,7 @@ export async function handleSync(
 ): Promise<Response> {
   const authHeader = request.headers.get("Authorization");
   const token = authHeader?.replace("Bearer ", "");
-  if (!token || token !== env.AUTH_TOKEN) {
+  if (!token || token !== await env.AUTH_TOKEN.get()) {
     return new Response("Unauthorized", { status: 401 });
   }
 
@@ -39,20 +47,24 @@ export async function handleSync(
   let notesUpserted = 0;
   let cardsUpserted = 0;
 
-  for (const deck of decks) {
-    await env.DB.prepare(
+  // Batch upsert decks
+  const deckStmts = decks.map((deck) =>
+    env.DB.prepare(
       `INSERT INTO decks (id, name, card_count)
        VALUES (?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          name = excluded.name,
          card_count = excluded.card_count,
          uploaded_at = datetime('now')`
-    )
-      .bind(deck.id, deck.name, deck.cards.length)
-      .run();
+    ).bind(deck.id, deck.name, deck.cards.length)
+  );
+  await batchInsert(env.DB, deckStmts);
 
-    for (const note of deck.notes) {
-      await env.DB.prepare(
+  // Batch upsert notes
+  const noteStmts = decks.flatMap((deck) =>
+    deck.notes.map((note) => {
+      notesUpserted++;
+      return env.DB.prepare(
         `INSERT INTO notes (id, deck_id, model_name, fields, field_names, tags)
          VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
@@ -61,14 +73,16 @@ export async function handleSync(
            fields = excluded.fields,
            field_names = excluded.field_names,
            tags = excluded.tags`
-      )
-        .bind(note.id, deck.id, note.modelName, JSON.stringify(note.fields), JSON.stringify(note.fieldNames), note.tags)
-        .run();
-      notesUpserted++;
-    }
+      ).bind(note.id, deck.id, note.modelName, JSON.stringify(note.fields), JSON.stringify(note.fieldNames), note.tags);
+    })
+  );
+  await batchInsert(env.DB, noteStmts);
 
-    for (const card of deck.cards) {
-      await env.DB.prepare(
+  // Batch upsert cards
+  const cardStmts = decks.flatMap((deck) =>
+    deck.cards.map((card) => {
+      cardsUpserted++;
+      return env.DB.prepare(
         `INSERT INTO cards (id, note_id, deck_id, ord, type, queue, due, ivl, factor, reps, lapses, flags)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
@@ -83,21 +97,18 @@ export async function handleSync(
            reps = excluded.reps,
            lapses = excluded.lapses,
            flags = excluded.flags`
-      )
-        .bind(card.id, card.noteId, card.deckId, card.ord, card.type, card.queue, card.due, card.ivl, card.factor, card.reps, card.lapses, card.flags)
-        .run();
-      cardsUpserted++;
-    }
-  }
+      ).bind(card.id, card.noteId, card.deckId, card.ord, card.type, card.queue, card.due, card.ivl, card.factor, card.reps, card.lapses, card.flags);
+    })
+  );
+  await batchInsert(env.DB, cardStmts);
 
-  // Upsert reviews (INSERT OR IGNORE since review IDs are timestamps and immutable)
-  for (const rev of reviews) {
-    await env.DB.prepare(
+  // Batch upsert reviews
+  const revStmts = reviews.map((rev) =>
+    env.DB.prepare(
       "INSERT OR IGNORE INTO revlog (id, card_id, ease, ivl, last_ivl, factor, review_time, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-      .bind(rev.id, rev.cardId, rev.ease, rev.ivl, rev.lastIvl, rev.factor, rev.reviewTime, rev.type)
-      .run();
-  }
+    ).bind(rev.id, rev.cardId, rev.ease, rev.ivl, rev.lastIvl, rev.factor, rev.reviewTime, rev.type)
+  );
+  await batchInsert(env.DB, revStmts);
 
   const summary = decks.map((d) => ({
     name: d.name,

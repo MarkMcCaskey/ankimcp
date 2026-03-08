@@ -14,9 +14,9 @@ export default defineWorkersConfig({
             BUCKET: "test-bucket",
           },
           bindings: {
-            AUTH_TOKEN: "test-secret-token",
-            SYNC_USERNAME: "testuser",
-            SYNC_PASSWORD: "testpass",
+            AUTH_TOKEN: { get: () => Promise.resolve("test-secret-token") },
+            SYNC_USERNAME: { get: () => Promise.resolve("testuser") },
+            SYNC_PASSWORD: { get: () => Promise.resolve("testpass") },
           },
         },
       },

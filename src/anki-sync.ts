@@ -118,7 +118,7 @@ async function handleHostKey(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: "missing username or password" }, 400);
   }
 
-  if (credentials.u !== env.SYNC_USERNAME || credentials.p !== env.SYNC_PASSWORD) {
+  if (credentials.u !== await env.SYNC_USERNAME.get() || credentials.p !== await env.SYNC_PASSWORD.get()) {
     return jsonResponse({ error: "invalid credentials" }, 403);
   }
 
@@ -224,37 +224,40 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     env.DB.prepare("DELETE FROM decks"),
   ]);
 
-  for (const deck of decks) {
-    await env.DB.prepare(
-      "INSERT INTO decks (id, name, card_count) VALUES (?, ?, ?)"
-    )
+  // Batch insert to avoid Worker time limits
+  const BATCH_SIZE = 100;
+  const batchInsert = async (stmts: D1PreparedStatement[]) => {
+    for (let i = 0; i < stmts.length; i += BATCH_SIZE) {
+      await env.DB.batch(stmts.slice(i, i + BATCH_SIZE));
+    }
+  };
+
+  await batchInsert(decks.map((deck) =>
+    env.DB.prepare("INSERT INTO decks (id, name, card_count) VALUES (?, ?, ?)")
       .bind(deck.id, deck.name, deck.cards.length)
-      .run();
+  ));
 
-    for (const note of deck.notes) {
-      await env.DB.prepare(
+  await batchInsert(decks.flatMap((deck) =>
+    deck.notes.map((note) =>
+      env.DB.prepare(
         "INSERT OR IGNORE INTO notes (id, deck_id, model_name, fields, field_names, tags) VALUES (?, ?, ?, ?, ?, ?)"
-      )
-        .bind(note.id, deck.id, note.modelName, JSON.stringify(note.fields), JSON.stringify(note.fieldNames), note.tags)
-        .run();
-    }
-
-    for (const card of deck.cards) {
-      await env.DB.prepare(
-        "INSERT OR IGNORE INTO cards (id, note_id, deck_id, ord, type, queue, due, ivl, factor, reps, lapses, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      )
-        .bind(card.id, card.noteId, card.deckId, card.ord, card.type, card.queue, card.due, card.ivl, card.factor, card.reps, card.lapses, card.flags)
-        .run();
-    }
-  }
-
-  for (const rev of reviews) {
-    await env.DB.prepare(
-      "INSERT OR IGNORE INTO revlog (id, card_id, ease, ivl, last_ivl, factor, review_time, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(note.id, deck.id, note.modelName, JSON.stringify(note.fields), JSON.stringify(note.fieldNames), note.tags)
     )
-      .bind(rev.id, rev.cardId, rev.ease, rev.ivl, rev.lastIvl, rev.factor, rev.reviewTime, rev.type)
-      .run();
-  }
+  ));
+
+  await batchInsert(decks.flatMap((deck) =>
+    deck.cards.map((card) =>
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO cards (id, note_id, deck_id, ord, type, queue, due, ivl, factor, reps, lapses, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(card.id, card.noteId, card.deckId, card.ord, card.type, card.queue, card.due, card.ivl, card.factor, card.reps, card.lapses, card.flags)
+    )
+  ));
+
+  await batchInsert(reviews.map((rev) =>
+    env.DB.prepare(
+      "INSERT OR IGNORE INTO revlog (id, card_id, ease, ivl, last_ivl, factor, review_time, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(rev.id, rev.cardId, rev.ease, rev.ivl, rev.lastIvl, rev.factor, rev.reviewTime, rev.type)
+  ));
 
   // Extract schema_mod and last_mod from the uploaded collection to store
   // so that future meta requests can return matching schema timestamp

@@ -1,5 +1,6 @@
 import "./polyfills";
 import { unzipSync } from "fflate";
+import * as fzstd from "fzstd";
 // Use asm.js build to avoid WASM loading issues in Workers
 // @ts-expect-error -- no types for asm build
 import initSqlJs from "sql.js/dist/sql-asm.js";
@@ -52,14 +53,6 @@ export interface ParseResult {
   reviews: ParsedReview[];
 }
 
-interface AnkiCol {
-  decks: Record<string, { name: string }>;
-  models: Record<
-    string,
-    { name: string; flds: Array<{ name: string }> }
-  >;
-}
-
 const FIELD_SEPARATOR = "\x1f";
 
 /**
@@ -70,11 +63,17 @@ export async function parseApkg(
 ): Promise<ParseResult> {
   const files = unzipSync(new Uint8Array(data));
 
-  const dbFile =
-    files["collection.anki21"] ?? files["collection.anki2"];
+  // Try formats in order: anki21b (new, zstd-compressed), anki21, anki2 (legacy)
+  const anki21b = files["collection.anki21b"];
+  if (anki21b) {
+    const decompressed = fzstd.decompress(anki21b) as Uint8Array;
+    return parseAnkiSqlite(decompressed);
+  }
+
+  const dbFile = files["collection.anki21"] ?? files["collection.anki2"];
   if (!dbFile) {
     throw new Error(
-      "No collection.anki21 or collection.anki2 found in .apkg"
+      "No collection.anki21b, collection.anki21, or collection.anki2 found in .apkg"
     );
   }
 
@@ -101,30 +100,67 @@ export async function parseAnkiSqlite(
 }
 
 function extractDecks(db: Database): ParsedDeck[] {
-  const colRows = db.exec(
-    "SELECT decks, models FROM col LIMIT 1"
-  );
-  if (colRows.length === 0 || colRows[0].values.length === 0) {
-    throw new Error("No collection metadata found");
-  }
-
-  const decksJson = colRows[0].values[0][0] as string;
-  const modelsJson = colRows[0].values[0][1] as string;
-
-  const col: AnkiCol = {
-    decks: JSON.parse(decksJson),
-    models: JSON.parse(modelsJson),
-  };
-
+  // Build model map: try new schema tables first, fall back to col.models
   const modelMap = new Map<
     string,
     { name: string; fieldNames: string[] }
   >();
-  for (const [mid, model] of Object.entries(col.models)) {
-    modelMap.set(mid, {
-      name: model.name,
-      fieldNames: model.flds.map((f) => f.name),
-    });
+
+  const hasNotetypes = tableExists(db, "notetypes");
+  const hasFieldsTable = tableExists(db, "fields");
+
+  if (hasNotetypes && hasFieldsTable) {
+    // New schema (anki21b / schema v18+): notetypes + fields tables
+    const ntRows = db.exec("SELECT id, name FROM notetypes");
+    if (ntRows.length > 0) {
+      for (const row of ntRows[0].values) {
+        modelMap.set(String(row[0]), { name: row[1] as string, fieldNames: [] });
+      }
+    }
+    const fieldRows = db.exec("SELECT ntid, ord, name FROM fields ORDER BY ntid, ord");
+    if (fieldRows.length > 0) {
+      for (const row of fieldRows[0].values) {
+        const model = modelMap.get(String(row[0]));
+        if (model) {
+          model.fieldNames.push(row[2] as string);
+        }
+      }
+    }
+  } else {
+    // Legacy schema: col.models JSON
+    const colRows = db.exec("SELECT models FROM col LIMIT 1");
+    if (colRows.length > 0 && colRows[0].values.length > 0) {
+      const modelsJson = colRows[0].values[0][0] as string;
+      const models = JSON.parse(modelsJson) as Record<string, { name: string; flds: Array<{ name: string }> }>;
+      for (const [mid, model] of Object.entries(models)) {
+        modelMap.set(mid, {
+          name: model.name,
+          fieldNames: model.flds.map((f) => f.name),
+        });
+      }
+    }
+  }
+
+  // Build deck name map: try new schema table first, fall back to col.decks
+  const deckNameMap = new Map<string, string>();
+  const hasDecksTable = tableExists(db, "decks") && hasNotetypes; // "decks" also exists in D1, so check notetypes to confirm new schema
+
+  if (hasDecksTable) {
+    const deckRows = db.exec("SELECT id, name FROM decks");
+    if (deckRows.length > 0) {
+      for (const row of deckRows[0].values) {
+        deckNameMap.set(String(row[0]), row[1] as string);
+      }
+    }
+  } else {
+    const colRows = db.exec("SELECT decks FROM col LIMIT 1");
+    if (colRows.length > 0 && colRows[0].values.length > 0) {
+      const decksJson = colRows[0].values[0][0] as string;
+      const colDecks = JSON.parse(decksJson) as Record<string, { name: string }>;
+      for (const [deckId, deckInfo] of Object.entries(colDecks)) {
+        deckNameMap.set(deckId, deckInfo.name);
+      }
+    }
   }
 
   // Extract notes
@@ -157,6 +193,7 @@ function extractDecks(db: Database): ParsedDeck[] {
     "SELECT id, nid, did, ord, type, queue, due, ivl, factor, reps, lapses, flags FROM cards"
   );
   const cardsByDeck = new Map<string, ParsedCard[]>();
+  const allDeckIds = new Set<string>();
   if (cardRows.length > 0) {
     for (const row of cardRows[0].values) {
       const card: ParsedCard = {
@@ -176,11 +213,17 @@ function extractDecks(db: Database): ParsedDeck[] {
       const existing = cardsByDeck.get(card.deckId) ?? [];
       existing.push(card);
       cardsByDeck.set(card.deckId, existing);
+      allDeckIds.add(card.deckId);
     }
   }
 
+  // Include all deck IDs from both the deck map and from cards
+  for (const deckId of deckNameMap.keys()) {
+    allDeckIds.add(deckId);
+  }
+
   const decks: ParsedDeck[] = [];
-  for (const [deckId, deckInfo] of Object.entries(col.decks)) {
+  for (const deckId of allDeckIds) {
     const cards = cardsByDeck.get(deckId) ?? [];
     const noteIds = new Set(cards.map((c) => c.noteId));
     const notes = [...noteIds]
@@ -189,13 +232,20 @@ function extractDecks(db: Database): ParsedDeck[] {
 
     decks.push({
       id: deckId,
-      name: deckInfo.name,
+      name: deckNameMap.get(deckId) ?? `Deck ${deckId}`,
       notes,
       cards,
     });
   }
 
   return decks;
+}
+
+function tableExists(db: Database, name: string): boolean {
+  const result = db.exec(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='${name}'`
+  );
+  return result.length > 0 && result[0].values.length > 0;
 }
 
 function extractReviews(db: Database): ParsedReview[] {
