@@ -63,7 +63,7 @@ describe("Upload endpoint", () => {
     form.append("file", new File(["data"], "notes.txt", { type: "text/plain" }));
     const res = await SELF.fetch("https://fake.host/upload", {
       method: "POST",
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: "Bearer e2e-test-token" },
       body: form,
     });
     expect(res.status).toBe(400);
@@ -74,7 +74,7 @@ describe("Upload endpoint", () => {
     const form = new FormData();
     const res = await SELF.fetch("https://fake.host/upload", {
       method: "POST",
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: "Bearer e2e-test-token" },
       body: form,
     });
     expect(res.status).toBe(400);
@@ -86,7 +86,7 @@ describe("Upload endpoint", () => {
 
     const res = await SELF.fetch("https://fake.host/upload", {
       method: "POST",
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: "Bearer e2e-test-token" },
       body: form,
     });
 
@@ -106,9 +106,9 @@ describe("Upload endpoint", () => {
     const cardResult = await env.DB.prepare("SELECT * FROM cards WHERE ivl > 0").all();
     expect(cardResult.results.length).toBeGreaterThan(0);
 
-    // Verify review history
-    const revResult = await env.DB.prepare("SELECT * FROM revlog").all();
-    expect(revResult.results).toHaveLength(9);
+    // Revlog is no longer stored in D1 (queried from R2 instead to save write quota)
+    // Verify the response still reports the review count
+    expect(body.reviewCount).toBe(9);
   });
 });
 
@@ -132,7 +132,7 @@ describe("Sync endpoint", () => {
 
     const res = await SELF.fetch("https://fake.host/sync", {
       method: "POST",
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: "Bearer e2e-test-token" },
       body: form,
     });
 
@@ -157,7 +157,7 @@ describe("Sync endpoint", () => {
     form1.append("file", new File([simple_apkg], "simple.apkg", { type: "application/octet-stream" }));
     await SELF.fetch("https://fake.host/sync", {
       method: "POST",
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: "Bearer e2e-test-token" },
       body: form1,
     });
 
@@ -168,7 +168,7 @@ describe("Sync endpoint", () => {
     form2.append("file", new File([simple_apkg], "simple.apkg", { type: "application/octet-stream" }));
     await SELF.fetch("https://fake.host/sync", {
       method: "POST",
-      headers: { Authorization: "Bearer test-secret-token" },
+      headers: { Authorization: "Bearer e2e-test-token" },
       body: form2,
     });
 

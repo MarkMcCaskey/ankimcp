@@ -1,4 +1,5 @@
 import { parseAnkiSqlite } from "./apkg";
+import { resolveSecret } from "./types";
 import type { Env } from "./types";
 import {
   handleStart,
@@ -118,7 +119,7 @@ async function handleHostKey(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: "missing username or password" }, 400);
   }
 
-  if (credentials.u !== await env.SYNC_USERNAME.get() || credentials.p !== await env.SYNC_PASSWORD.get()) {
+  if (credentials.u !== await resolveSecret(env.SYNC_USERNAME) || credentials.p !== await resolveSecret(env.SYNC_PASSWORD)) {
     return jsonResponse({ error: "invalid credentials" }, 403);
   }
 
@@ -214,11 +215,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   await env.BUCKET.put(COLLECTION_R2_KEY, body);
 
   // Parse the SQLite database and store in D1
-  const { decks, reviews } = await parseAnkiSqlite(body);
+  // Note: revlog is NOT stored in D1 to reduce write volume.
+  // MCP queries that need revlog data read from the R2 SQLite collection directly.
+  const { decks } = await parseAnkiSqlite(body);
 
-  // Clear existing data and insert new
+  // Clear existing data and insert new (no revlog in D1)
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM revlog"),
     env.DB.prepare("DELETE FROM cards"),
     env.DB.prepare("DELETE FROM notes"),
     env.DB.prepare("DELETE FROM decks"),
@@ -253,11 +255,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     )
   ));
 
-  await batchInsert(reviews.map((rev) =>
-    env.DB.prepare(
-      "INSERT OR IGNORE INTO revlog (id, card_id, ease, ivl, last_ivl, factor, review_time, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).bind(rev.id, rev.cardId, rev.ease, rev.ivl, rev.lastIvl, rev.factor, rev.reviewTime, rev.type)
-  ));
+  // Note: revlog is NOT inserted into D1 to stay within free-tier write limits.
+  // MCP queries that need revlog data load from the R2 SQLite collection via sql.js.
 
   // Extract schema_mod and last_mod from the uploaded collection to store
   // so that future meta requests can return matching schema timestamp

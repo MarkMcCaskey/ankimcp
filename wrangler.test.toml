@@ -1,0 +1,16 @@
+name = "ankimcp"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "anki-cards"
+database_id = "test-db"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "anki-decks"
+
+# Use plain vars instead of secrets store for testing
+# Secrets are loaded from .dev.vars by wrangler automatically

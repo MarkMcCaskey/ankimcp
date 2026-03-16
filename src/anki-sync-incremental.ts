@@ -561,6 +561,10 @@ function getServerSanityCheckCounts(db: AnkiDatabase): SanityCheckCountsTuple {
 /**
  * Re-parse the Anki SQLite collection into D1 for MCP queries.
  * This is called after finish to keep D1 in sync.
+ *
+ * Note: revlog is NOT stored in D1 to reduce write volume against
+ * Cloudflare's free-tier limit (100k rows/day). MCP queries that
+ * need revlog data load directly from the R2 SQLite collection.
  */
 async function refreshD1FromCollection(db: AnkiDatabase, env: Env): Promise<void> {
   // Extract decks from col table
@@ -578,13 +582,15 @@ async function refreshD1FromCollection(db: AnkiDatabase, env: Env): Promise<void
     });
   }
 
-  // Clear and rebuild D1
+  // Clear and rebuild D1 (no revlog — queried from R2 instead)
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM revlog"),
     env.DB.prepare("DELETE FROM cards"),
     env.DB.prepare("DELETE FROM notes"),
     env.DB.prepare("DELETE FROM decks"),
   ]);
+
+  const BATCH_SIZE = 100;
+  const statements: ReturnType<typeof env.DB.prepare>[] = [];
 
   // Insert decks
   const cardCounts = new Map<string, number>();
@@ -596,9 +602,22 @@ async function refreshD1FromCollection(db: AnkiDatabase, env: Env): Promise<void
   }
 
   for (const [deckId, deckInfo] of Object.entries(decksJson)) {
-    await env.DB.prepare("INSERT INTO decks (id, name, card_count) VALUES (?, ?, ?)")
-      .bind(deckId, deckInfo.name, cardCounts.get(deckId) ?? 0)
-      .run();
+    statements.push(
+      env.DB.prepare("INSERT INTO decks (id, name, card_count) VALUES (?, ?, ?)")
+        .bind(deckId, deckInfo.name, cardCounts.get(deckId) ?? 0)
+    );
+  }
+
+  // Build note-to-deck mapping in bulk instead of per-note queries
+  const noteDeckMap = new Map<number, string>();
+  const noteDeckResult = db.exec("SELECT nid, did FROM cards");
+  if (noteDeckResult.length > 0) {
+    for (const row of noteDeckResult[0].values) {
+      const nid = row[0] as number;
+      if (!noteDeckMap.has(nid)) {
+        noteDeckMap.set(nid, String(row[1]));
+      }
+    }
   }
 
   // Insert notes
@@ -612,14 +631,12 @@ async function refreshD1FromCollection(db: AnkiDatabase, env: Env): Promise<void
       const model = modelMap.get(modelId);
       const fields = fieldsRaw.split("\x1f");
       const fieldNames = model?.fieldNames ?? fields.map((_, i) => `Field ${i + 1}`);
+      const deckId = noteDeckMap.get(noteId) ?? "1";
 
-      // A note can have cards in multiple decks; pick the first card's deck
-      const deckLookup = db.exec(`SELECT did FROM cards WHERE nid = ${Number(noteId)} LIMIT 1`);
-      const deckId = deckLookup.length > 0 ? String(deckLookup[0].values[0][0]) : "1";
-
-      await env.DB.prepare(
-        "INSERT OR IGNORE INTO notes (id, deck_id, model_name, fields, field_names, tags) VALUES (?, ?, ?, ?, ?, ?)"
-      ).bind(noteId, deckId, model?.name ?? "Unknown", JSON.stringify(fields), JSON.stringify(fieldNames), tags).run();
+      statements.push(
+        env.DB.prepare("INSERT OR IGNORE INTO notes (id, deck_id, model_name, fields, field_names, tags) VALUES (?, ?, ?, ?, ?, ?)")
+          .bind(noteId, deckId, model?.name ?? "Unknown", JSON.stringify(fields), JSON.stringify(fieldNames), tags)
+      );
     }
   }
 
@@ -629,26 +646,19 @@ async function refreshD1FromCollection(db: AnkiDatabase, env: Env): Promise<void
   );
   if (allCardsResult.length > 0) {
     for (const row of allCardsResult[0].values) {
-      await env.DB.prepare(
-        "INSERT OR IGNORE INTO cards (id, note_id, deck_id, ord, type, queue, due, ivl, factor, reps, lapses, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      ).bind(
-        row[0] as number, row[1] as number, String(row[2]), row[3] as number,
-        row[4] as number, row[5] as number, row[6] as number, row[7] as number,
-        row[8] as number, row[9] as number, row[10] as number, row[11] as number
-      ).run();
+      statements.push(
+        env.DB.prepare("INSERT OR IGNORE INTO cards (id, note_id, deck_id, ord, type, queue, due, ivl, factor, reps, lapses, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(
+            row[0] as number, row[1] as number, String(row[2]), row[3] as number,
+            row[4] as number, row[5] as number, row[6] as number, row[7] as number,
+            row[8] as number, row[9] as number, row[10] as number, row[11] as number
+          )
+      );
     }
   }
 
-  // Insert revlog
-  const allRevlogResult = db.exec("SELECT id, cid, ease, ivl, lastIvl, factor, time, type FROM revlog");
-  if (allRevlogResult.length > 0) {
-    for (const row of allRevlogResult[0].values) {
-      await env.DB.prepare(
-        "INSERT OR IGNORE INTO revlog (id, card_id, ease, ivl, last_ivl, factor, review_time, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      ).bind(
-        row[0] as number, row[1] as number, row[2] as number, row[3] as number,
-        row[4] as number, row[5] as number, row[6] as number, row[7] as number
-      ).run();
-    }
+  // Execute in batches
+  for (let i = 0; i < statements.length; i += BATCH_SIZE) {
+    await env.DB.batch(statements.slice(i, i + BATCH_SIZE));
   }
 }

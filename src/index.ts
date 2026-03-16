@@ -4,7 +4,23 @@ import { z } from "zod";
 import { handleUpload } from "./upload";
 import { handleSync } from "./sync";
 import { handleAnkiSync } from "./anki-sync";
+import { loadCollection } from "./anki-collection";
+import type { AnkiDatabase } from "./anki-collection";
 import type { Env } from "./types";
+
+/**
+ * Query revlog data from the R2 SQLite collection instead of D1.
+ * This avoids storing revlog in D1 (saves ~60-80% of write volume).
+ */
+async function queryRevlog<T>(env: Env, fn: (db: AnkiDatabase) => T): Promise<T | null> {
+  const db = await loadCollection(env);
+  if (!db) return null;
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
 
 function parseFieldMap(fieldsJson: string, fieldNamesJson: string): Record<string, string> {
   const fields = JSON.parse(fieldsJson) as string[];
@@ -207,21 +223,20 @@ function buildMcpServer(env: Env): McpServer {
 
       const row = cardResult.results[0];
 
-      // Get review history
-      const revResult = await env.DB.prepare(
-        `SELECT id, ease, ivl, last_ivl, factor, review_time, type
-         FROM revlog WHERE card_id = ? ORDER BY id ASC`
-      ).bind(card_id).all();
-
-      const reviews = revResult.results.map((r) => ({
-        timestamp: new Date(r.id as number).toISOString(),
-        button: EASE_LABELS[r.ease as number] ?? `unknown(${r.ease})`,
-        new_interval: (r.ivl as number) >= 0 ? `${r.ivl}d` : `${Math.abs(r.ivl as number)}s`,
-        previous_interval: (r.last_ivl as number) >= 0 ? `${r.last_ivl}d` : `${Math.abs(r.last_ivl as number)}s`,
-        ease_factor: (r.factor as number) > 0 ? Number(((r.factor as number) / 1000).toFixed(2)) : null,
-        review_duration_ms: r.review_time,
-        review_type: (["learn", "review", "relearn", "filtered", "manual"] as const)[r.type as number] ?? "unknown",
-      }));
+      // Get review history from R2 SQLite (not stored in D1)
+      const reviews = await queryRevlog(env, (db) => {
+        const result = db.exec(`SELECT id, ease, ivl, lastIvl, factor, time, type FROM revlog WHERE cid = ${Number(card_id)} ORDER BY id ASC`);
+        if (result.length === 0) return [];
+        return result[0].values.map((r) => ({
+          timestamp: new Date(r[0] as number).toISOString(),
+          button: EASE_LABELS[r[1] as number] ?? `unknown(${r[1]})`,
+          new_interval: (r[2] as number) >= 0 ? `${r[2]}d` : `${Math.abs(r[2] as number)}s`,
+          previous_interval: (r[3] as number) >= 0 ? `${r[3]}d` : `${Math.abs(r[3] as number)}s`,
+          ease_factor: (r[4] as number) > 0 ? Number(((r[4] as number) / 1000).toFixed(2)) : null,
+          review_duration_ms: r[5],
+          review_type: (["learn", "review", "relearn", "filtered", "manual"] as const)[r[6] as number] ?? "unknown",
+        }));
+      }) ?? [];
 
       const card = {
         card_id: row.card_id,
@@ -260,26 +275,62 @@ function buildMcpServer(env: Env): McpServer {
     },
     async ({ deck_name, rank_by, limit }) => {
       limit = Math.min(limit, 100);
-      let sql: string;
-      const params: (string | number)[] = [];
 
       if (rank_by === "recent_failures") {
-        // Count 'Again' presses (ease=1) in recent reviews
-        sql = `SELECT c.id as card_id, c.type, c.ivl, c.factor, c.reps, c.lapses,
-                      n.fields, n.field_names, n.tags, n.model_name, d.name as deck_name,
-                      COUNT(r.id) as again_count
-               FROM cards c
-               JOIN notes n ON c.note_id = n.id
-               JOIN decks d ON c.deck_id = d.id
-               LEFT JOIN revlog r ON r.card_id = c.id AND r.ease = 1
-               WHERE c.reps > 0`;
+        // Get again counts from R2 SQLite (revlog not in D1)
+        const againCounts = await queryRevlog(env, (db) => {
+          const result = db.exec(`SELECT cid, COUNT(*) as cnt FROM revlog WHERE ease = 1 GROUP BY cid HAVING cnt > 0 ORDER BY cnt DESC LIMIT ${Number(limit) * 2}`);
+          if (result.length === 0) return [];
+          return result[0].values.map((r) => ({ cid: r[0] as number, count: r[1] as number }));
+        }) ?? [];
+
+        if (againCounts.length === 0) {
+          return { content: [{ type: "text" as const, text: "[]" }] };
+        }
+
+        // Fetch card details from D1 for these card IDs
+        const cardIds = againCounts.map((a) => a.cid);
+        const againMap = new Map(againCounts.map((a) => [a.cid, a.count]));
+        const placeholders = cardIds.map(() => "?").join(",");
+        let sql = `SELECT c.id as card_id, c.type, c.ivl, c.factor, c.reps, c.lapses,
+                          n.fields, n.field_names, n.tags, n.model_name, d.name as deck_name
+                   FROM cards c
+                   JOIN notes n ON c.note_id = n.id
+                   JOIN decks d ON c.deck_id = d.id
+                   WHERE c.id IN (${placeholders})`;
+        const params: (string | number)[] = [...cardIds];
         if (deck_name) {
           sql += " AND d.name LIKE ?";
           params.push(`%${deck_name}%`);
         }
-        sql += " GROUP BY c.id HAVING again_count > 0 ORDER BY again_count DESC LIMIT ?";
-        params.push(limit);
-      } else if (rank_by === "low_ease") {
+        const result = await env.DB.prepare(sql).bind(...params).all();
+
+        const cards = result.results
+          .map((row) => ({
+            card_id: row.card_id,
+            deck: row.deck_name,
+            model: row.model_name,
+            state: CARD_TYPE_LABELS[row.type as number] ?? "unknown",
+            tags: row.tags,
+            fields: parseFieldMap(row.fields as string, row.field_names as string),
+            lapses: row.lapses,
+            total_reviews: row.reps,
+            interval_days: row.ivl,
+            ease_factor: (row.factor as number) > 0 ? Number(((row.factor as number) / 1000).toFixed(2)) : null,
+            again_count: againMap.get(row.card_id as number) ?? 0,
+          }))
+          .sort((a, b) => b.again_count - a.again_count)
+          .slice(0, limit);
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(cards, null, 2) }],
+        };
+      }
+
+      let sql: string;
+      const params: (string | number)[] = [];
+
+      if (rank_by === "low_ease") {
         sql = `SELECT c.id as card_id, c.type, c.ivl, c.factor, c.reps, c.lapses,
                       n.fields, n.field_names, n.tags, n.model_name, d.name as deck_name
                FROM cards c
@@ -321,7 +372,6 @@ function buildMcpServer(env: Env): McpServer {
         total_reviews: row.reps,
         interval_days: row.ivl,
         ease_factor: (row.factor as number) > 0 ? Number(((row.factor as number) / 1000).toFixed(2)) : null,
-        ...(rank_by === "recent_failures" ? { again_count: row.again_count } : {}),
       }));
 
       return {
@@ -340,78 +390,93 @@ function buildMcpServer(env: Env): McpServer {
       days: z.number().default(30).describe("Number of days to look back (0 = all time)"),
     },
     async ({ deck_name, tag, days }) => {
-      let whereClause = "WHERE 1=1";
-      const params: (string | number)[] = [];
-
-      if (days > 0) {
-        const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-        whereClause += " AND r.id >= ?";
-        params.push(cutoff);
-      }
-
-      let joinClause = "FROM revlog r";
-      if (deck_name || tag) {
-        joinClause += " JOIN cards c ON r.card_id = c.id JOIN notes n ON c.note_id = n.id JOIN decks d ON c.deck_id = d.id";
-        if (deck_name) {
-          whereClause += " AND d.name LIKE ?";
-          params.push(`%${deck_name}%`);
+      // Query revlog from R2 SQLite (not stored in D1)
+      const statsData = await queryRevlog(env, (db) => {
+        let whereClause = "WHERE 1=1";
+        if (days > 0) {
+          const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+          whereClause += ` AND r.id >= ${cutoff}`;
         }
-        if (tag) {
-          whereClause += " AND n.tags LIKE ?";
-          params.push(`%${tag}%`);
+
+        let joinClause = "FROM revlog r";
+        // In the R2 SQLite, revlog uses 'cid' for card_id, cards uses 'nid'/'did', notes uses 'mid'/'flds'/'tags'
+        if (deck_name || tag) {
+          joinClause += " JOIN cards c ON r.cid = c.id JOIN notes n ON c.nid = n.id";
+          if (deck_name) {
+            // Need to look up deck name from col.decks JSON — use did filtering
+            // For simplicity, get all deck IDs matching the name from col table
+            const colResult = db.exec("SELECT decks FROM col LIMIT 1");
+            if (colResult.length > 0) {
+              const decks = JSON.parse(colResult[0].values[0][0] as string) as Record<string, { name: string }>;
+              const matchingDids = Object.entries(decks)
+                .filter(([, d]) => d.name.toLowerCase().includes(deck_name!.toLowerCase()))
+                .map(([id]) => id);
+              if (matchingDids.length > 0) {
+                whereClause += ` AND c.did IN (${matchingDids.join(",")})`;
+              } else {
+                whereClause += " AND 0"; // no matching decks
+              }
+            }
+          }
+          if (tag) {
+            whereClause += ` AND n.tags LIKE '%${tag.replace(/'/g, "''")}%'`;
+          }
         }
-      }
 
-      const statsResult = await env.DB.prepare(
-        `SELECT
-           COUNT(*) as total_reviews,
-           SUM(CASE WHEN r.ease = 1 THEN 1 ELSE 0 END) as again_count,
-           SUM(CASE WHEN r.ease = 2 THEN 1 ELSE 0 END) as hard_count,
-           SUM(CASE WHEN r.ease = 3 THEN 1 ELSE 0 END) as good_count,
-           SUM(CASE WHEN r.ease = 4 THEN 1 ELSE 0 END) as easy_count,
-           AVG(r.review_time) as avg_review_time_ms,
-           COUNT(DISTINCT date(r.id / 1000, 'unixepoch')) as days_studied,
-           MIN(r.id) as first_review,
-           MAX(r.id) as last_review
-         ${joinClause} ${whereClause}`
-      ).bind(...params).first();
+        const statsResult = db.exec(
+          `SELECT
+             COUNT(*) as total_reviews,
+             SUM(CASE WHEN r.ease = 1 THEN 1 ELSE 0 END) as again_count,
+             SUM(CASE WHEN r.ease = 2 THEN 1 ELSE 0 END) as hard_count,
+             SUM(CASE WHEN r.ease = 3 THEN 1 ELSE 0 END) as good_count,
+             SUM(CASE WHEN r.ease = 4 THEN 1 ELSE 0 END) as easy_count,
+             AVG(r.time) as avg_review_time_ms,
+             COUNT(DISTINCT date(r.id / 1000, 'unixepoch')) as days_studied,
+             MIN(r.id) as first_review,
+             MAX(r.id) as last_review
+           ${joinClause} ${whereClause}`
+        );
 
-      // Daily breakdown (last N days)
-      const dailyParams = [...params];
-      const dailyResult = await env.DB.prepare(
-        `SELECT date(r.id / 1000, 'unixepoch') as day,
-                COUNT(*) as reviews,
-                SUM(CASE WHEN r.ease = 1 THEN 1 ELSE 0 END) as again,
-                AVG(r.review_time) as avg_time_ms
-         ${joinClause} ${whereClause}
-         GROUP BY day ORDER BY day DESC LIMIT 30`
-      ).bind(...dailyParams).all();
+        const dailyResult = db.exec(
+          `SELECT date(r.id / 1000, 'unixepoch') as day,
+                  COUNT(*) as reviews,
+                  SUM(CASE WHEN r.ease = 1 THEN 1 ELSE 0 END) as again,
+                  AVG(r.time) as avg_time_ms
+           ${joinClause} ${whereClause}
+           GROUP BY day ORDER BY day DESC LIMIT 30`
+        );
 
-      const total = (statsResult?.total_reviews as number) ?? 0;
+        const sr = statsResult.length > 0 ? statsResult[0].values[0] : null;
+        const daily = dailyResult.length > 0 ? dailyResult[0].values : [];
+
+        return { sr, daily };
+      });
+
+      const sr = statsData?.sr;
+      const daily = statsData?.daily ?? [];
+      const total = (sr?.[0] as number) ?? 0;
+      const daysStudied = (sr?.[6] as number) ?? 0;
+
       const stats = {
         period: days > 0 ? `last ${days} days` : "all time",
         total_reviews: total,
-        days_studied: statsResult?.days_studied ?? 0,
-        reviews_per_day: total > 0 && statsResult?.days_studied
-          ? Number((total / (statsResult.days_studied as number)).toFixed(1))
-          : 0,
+        days_studied: daysStudied,
+        reviews_per_day: total > 0 && daysStudied > 0 ? Number((total / daysStudied).toFixed(1)) : 0,
         button_distribution: {
-          again: statsResult?.again_count ?? 0,
-          hard: statsResult?.hard_count ?? 0,
-          good: statsResult?.good_count ?? 0,
-          easy: statsResult?.easy_count ?? 0,
-          again_pct: total > 0 ? Number((((statsResult?.again_count as number) ?? 0) / total * 100).toFixed(1)) : 0,
+          again: (sr?.[1] as number) ?? 0,
+          hard: (sr?.[2] as number) ?? 0,
+          good: (sr?.[3] as number) ?? 0,
+          easy: (sr?.[4] as number) ?? 0,
+          again_pct: total > 0 ? Number(((((sr?.[1] as number) ?? 0) / total) * 100).toFixed(1)) : 0,
         },
-        avg_review_time_ms: statsResult?.avg_review_time_ms
-          ? Number((statsResult.avg_review_time_ms as number).toFixed(0))
-          : null,
-        first_review: statsResult?.first_review ? new Date(statsResult.first_review as number).toISOString() : null,
-        last_review: statsResult?.last_review ? new Date(statsResult.last_review as number).toISOString() : null,
-        daily_breakdown: dailyResult.results.map((r) => ({
-          date: r.day,
-          reviews: r.reviews,
-          again: r.again,
-          avg_time_ms: r.avg_time_ms ? Number((r.avg_time_ms as number).toFixed(0)) : null,
+        avg_review_time_ms: sr?.[5] ? Number((sr[5] as number).toFixed(0)) : null,
+        first_review: sr?.[7] ? new Date(sr[7] as number).toISOString() : null,
+        last_review: sr?.[8] ? new Date(sr[8] as number).toISOString() : null,
+        daily_breakdown: daily.map((r) => ({
+          date: r[0],
+          reviews: r[1],
+          again: r[2],
+          avg_time_ms: r[3] ? Number((r[3] as number).toFixed(0)) : null,
         })),
       };
 
@@ -433,49 +498,76 @@ function buildMcpServer(env: Env): McpServer {
     },
     async ({ card_id, deck_name, days, limit }) => {
       limit = Math.min(limit, 500);
-      let sql = `SELECT r.id, r.card_id, r.ease, r.ivl, r.last_ivl, r.factor, r.review_time, r.type,
-                        n.fields, n.field_names, d.name as deck_name
-                 FROM revlog r
-                 JOIN cards c ON r.card_id = c.id
-                 JOIN notes n ON c.note_id = n.id
-                 JOIN decks d ON c.deck_id = d.id
-                 WHERE 1=1`;
-      const params: (string | number)[] = [];
 
-      if (card_id) {
-        sql += " AND r.card_id = ?";
-        params.push(card_id);
-      }
-      if (deck_name) {
-        sql += " AND d.name LIKE ?";
-        params.push(`%${deck_name}%`);
-      }
-      if (days > 0) {
-        const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-        sql += " AND r.id >= ?";
-        params.push(cutoff);
-      }
+      // Query revlog from R2 SQLite, joining with notes for card preview
+      const reviews = await queryRevlog(env, (db) => {
+        let whereClause = "WHERE 1=1";
+        let joinClause = "FROM revlog r JOIN cards c ON r.cid = c.id JOIN notes n ON c.nid = n.id";
 
-      sql += " ORDER BY r.id DESC LIMIT ?";
-      params.push(limit);
+        if (card_id) {
+          whereClause += ` AND r.cid = ${Number(card_id)}`;
+        }
+        if (deck_name) {
+          const colResult = db.exec("SELECT decks FROM col LIMIT 1");
+          if (colResult.length > 0) {
+            const decks = JSON.parse(colResult[0].values[0][0] as string) as Record<string, { name: string }>;
+            const matchingDids = Object.entries(decks)
+              .filter(([, d]) => d.name.toLowerCase().includes(deck_name!.toLowerCase()))
+              .map(([id]) => id);
+            if (matchingDids.length > 0) {
+              whereClause += ` AND c.did IN (${matchingDids.join(",")})`;
+            } else {
+              whereClause += " AND 0";
+            }
+          }
+        }
+        if (days > 0) {
+          const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+          whereClause += ` AND r.id >= ${cutoff}`;
+        }
 
-      const result = await env.DB.prepare(sql).bind(...params).all();
+        // Get deck name mapping
+        const colResult = db.exec("SELECT decks, models FROM col LIMIT 1");
+        const deckMap = new Map<string, string>();
+        const modelMap = new Map<string, string[]>();
+        if (colResult.length > 0) {
+          const decks = JSON.parse(colResult[0].values[0][0] as string) as Record<string, { name: string }>;
+          for (const [id, d] of Object.entries(decks)) deckMap.set(id, d.name);
+          const models = JSON.parse(colResult[0].values[0][1] as string) as Record<string, { flds: Array<{ name: string }> }>;
+          for (const [id, m] of Object.entries(models)) modelMap.set(id, m.flds.map((f) => f.name));
+        }
 
-      const reviews = result.results.map((r) => {
-        const fields = parseFieldMap(r.fields as string, r.field_names as string);
-        const firstField = Object.values(fields)[0] ?? "";
-        return {
-          timestamp: new Date(r.id as number).toISOString(),
-          card_id: r.card_id,
-          card_preview: firstField.substring(0, 80),
-          deck: r.deck_name,
-          button: EASE_LABELS[r.ease as number] ?? `unknown(${r.ease})`,
-          new_interval: (r.ivl as number) >= 0 ? `${r.ivl}d` : `${Math.abs(r.ivl as number)}s`,
-          previous_interval: (r.last_ivl as number) >= 0 ? `${r.last_ivl}d` : `${Math.abs(r.last_ivl as number)}s`,
-          review_duration_ms: r.review_time,
-          review_type: (["learn", "review", "relearn", "filtered", "manual"] as const)[r.type as number] ?? "unknown",
-        };
-      });
+        const result = db.exec(
+          `SELECT r.id, r.cid, r.ease, r.ivl, r.lastIvl, r.factor, r.time, r.type,
+                  n.flds, n.mid, c.did
+           ${joinClause} ${whereClause}
+           ORDER BY r.id DESC LIMIT ${Number(limit)}`
+        );
+
+        if (result.length === 0) return [];
+        return result[0].values.map((r) => {
+          const fieldsRaw = r[8] as string;
+          const modelId = String(r[9]);
+          const deckId = String(r[10]);
+          const fieldNames = modelMap.get(modelId) ?? [];
+          const fields = fieldsRaw.split("\x1f");
+          const fieldMap: Record<string, string> = {};
+          for (let i = 0; i < fieldNames.length; i++) fieldMap[fieldNames[i]] = fields[i] ?? "";
+          const firstField = fields[0] ?? "";
+
+          return {
+            timestamp: new Date(r[0] as number).toISOString(),
+            card_id: r[1],
+            card_preview: firstField.substring(0, 80),
+            deck: deckMap.get(deckId) ?? "Unknown",
+            button: EASE_LABELS[r[2] as number] ?? `unknown(${r[2]})`,
+            new_interval: (r[3] as number) >= 0 ? `${r[3]}d` : `${Math.abs(r[3] as number)}s`,
+            previous_interval: (r[4] as number) >= 0 ? `${r[4]}d` : `${Math.abs(r[4] as number)}s`,
+            review_duration_ms: r[6],
+            review_type: (["learn", "review", "relearn", "filtered", "manual"] as const)[r[7] as number] ?? "unknown",
+          };
+        });
+      }) ?? [];
 
       return {
         content: [{ type: "text" as const, text: JSON.stringify(reviews, null, 2) }],
@@ -505,18 +597,23 @@ function buildMcpServer(env: Env): McpServer {
         return { content: [{ type: "text" as const, text: `Card ${card_id} not found` }] };
       }
 
-      // Review stats
-      const revStats = await env.DB.prepare(
-        `SELECT COUNT(*) as total,
-                SUM(CASE WHEN ease = 1 THEN 1 ELSE 0 END) as again_count,
-                SUM(CASE WHEN ease >= 3 THEN 1 ELSE 0 END) as success_count,
-                AVG(review_time) as avg_time,
-                MIN(id) as first_review,
-                MAX(id) as last_review
-         FROM revlog WHERE card_id = ?`
-      ).bind(card_id).first();
+      // Review stats from R2 SQLite (revlog not in D1)
+      const revStats = await queryRevlog(env, (db) => {
+        const result = db.exec(
+          `SELECT COUNT(*) as total,
+                  SUM(CASE WHEN ease = 1 THEN 1 ELSE 0 END) as again_count,
+                  SUM(CASE WHEN ease >= 3 THEN 1 ELSE 0 END) as success_count,
+                  AVG(time) as avg_time,
+                  MIN(id) as first_review,
+                  MAX(id) as last_review
+           FROM revlog WHERE cid = ${Number(card_id)}`
+        );
+        if (result.length === 0 || result[0].values.length === 0) return null;
+        const r = result[0].values[0];
+        return { total: r[0] as number, again_count: r[1] as number, success_count: r[2] as number, avg_time: r[3] as number | null, first_review: r[4] as number | null, last_review: r[5] as number | null };
+      });
 
-      const total = (revStats?.total as number) ?? 0;
+      const total = revStats?.total ?? 0;
       const fields = parseFieldMap(cardRow.fields as string, cardRow.field_names as string);
 
       const stats = {
@@ -529,11 +626,11 @@ function buildMcpServer(env: Env): McpServer {
         current_ease_factor: (cardRow.factor as number) > 0 ? Number(((cardRow.factor as number) / 1000).toFixed(2)) : null,
         total_reviews: cardRow.reps,
         total_lapses: cardRow.lapses,
-        success_rate: total > 0 ? Number((((revStats?.success_count as number) ?? 0) / total * 100).toFixed(1)) : null,
-        again_rate: total > 0 ? Number((((revStats?.again_count as number) ?? 0) / total * 100).toFixed(1)) : null,
-        avg_review_time_ms: revStats?.avg_time ? Number((revStats.avg_time as number).toFixed(0)) : null,
-        first_reviewed: revStats?.first_review ? new Date(revStats.first_review as number).toISOString() : null,
-        last_reviewed: revStats?.last_review ? new Date(revStats.last_review as number).toISOString() : null,
+        success_rate: total > 0 ? Number(((revStats?.success_count ?? 0) / total * 100).toFixed(1)) : null,
+        again_rate: total > 0 ? Number(((revStats?.again_count ?? 0) / total * 100).toFixed(1)) : null,
+        avg_review_time_ms: revStats?.avg_time ? Number(revStats.avg_time.toFixed(0)) : null,
+        first_reviewed: revStats?.first_review ? new Date(revStats.first_review).toISOString() : null,
+        last_reviewed: revStats?.last_review ? new Date(revStats.last_review).toISOString() : null,
         maturity: cardRow.ivl === 0 ? "unseen"
           : (cardRow.ivl as number) < 21 ? "young"
           : (cardRow.ivl as number) < 90 ? "mature"

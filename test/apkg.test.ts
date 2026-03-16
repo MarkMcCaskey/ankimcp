@@ -57,7 +57,7 @@ describe("parseApkg", () => {
 
   it("throws when no collection db is found in zip", async () => {
     await expect(parseApkg(no_collection_zip.buffer)).rejects.toThrow(
-      /No collection\.anki21 or collection\.anki2/
+      /No collection\.anki21b.*found in \.apkg/
     );
   });
 });

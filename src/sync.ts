@@ -1,4 +1,5 @@
 import { parseApkg } from "./apkg";
+import { resolveSecret } from "./types";
 import type { Env } from "./types";
 
 const BATCH_SIZE = 100;
@@ -19,7 +20,7 @@ export async function handleSync(
 ): Promise<Response> {
   const authHeader = request.headers.get("Authorization");
   const token = authHeader?.replace("Bearer ", "");
-  if (!token || token !== await env.AUTH_TOKEN.get()) {
+  if (!token || token !== await resolveSecret(env.AUTH_TOKEN)) {
     return new Response("Unauthorized", { status: 401 });
   }
 

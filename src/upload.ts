@@ -1,4 +1,5 @@
 import { parseApkg } from "./apkg";
+import { resolveSecret } from "./types";
 import type { Env } from "./types";
 
 const BATCH_SIZE = 100;
@@ -16,7 +17,7 @@ export async function handleUpload(
 ): Promise<Response> {
   const authHeader = request.headers.get("Authorization");
   const token = authHeader?.replace("Bearer ", "");
-  if (!token || token !== await env.AUTH_TOKEN.get()) {
+  if (!token || token !== await resolveSecret(env.AUTH_TOKEN)) {
     return new Response("Unauthorized", { status: 401 });
   }
 
@@ -41,9 +42,8 @@ export async function handleUpload(
 
   const { decks, reviews } = await parseApkg(arrayBuffer);
 
-  // Clear existing data
+  // Clear existing data (no revlog in D1 — queried from R2 instead)
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM revlog"),
     env.DB.prepare("DELETE FROM cards"),
     env.DB.prepare("DELETE FROM notes"),
     env.DB.prepare("DELETE FROM decks"),
@@ -76,13 +76,8 @@ export async function handleUpload(
   );
   await batchInsert(env.DB, cardStmts);
 
-  // Batch insert reviews
-  const revStmts = reviews.map((rev) =>
-    env.DB.prepare(
-      "INSERT OR IGNORE INTO revlog (id, card_id, ease, ivl, last_ivl, factor, review_time, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).bind(rev.id, rev.cardId, rev.ease, rev.ivl, rev.lastIvl, rev.factor, rev.reviewTime, rev.type)
-  );
-  await batchInsert(env.DB, revStmts);
+  // Note: revlog is NOT inserted into D1 to stay within free-tier write limits.
+  // MCP queries that need revlog data load from the R2 SQLite collection via sql.js.
 
   const summary = decks.map((d) => ({
     name: d.name,

@@ -5,18 +5,13 @@ export default defineWorkersConfig({
     exclude: ["test/e2e.test.ts", "node_modules"],
     poolOptions: {
       workers: {
-        wrangler: { configPath: "./wrangler.toml" },
+        wrangler: { configPath: "./wrangler.test.toml" },
         miniflare: {
           d1Databases: {
             DB: "test-db",
           },
           r2Buckets: {
             BUCKET: "test-bucket",
-          },
-          bindings: {
-            AUTH_TOKEN: { get: () => Promise.resolve("test-secret-token") },
-            SYNC_USERNAME: { get: () => Promise.resolve("testuser") },
-            SYNC_PASSWORD: { get: () => Promise.resolve("testpass") },
           },
         },
       },
